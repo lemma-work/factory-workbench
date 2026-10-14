@@ -72,4 +72,6 @@ json.dump({"state": "up", "sha": sha, "api": api, "web": web,
                        "backend_boot": backend.get("boot_seconds")},
            "health": backend.get("health")}, open(f"{out}/stack.json", "w"), indent=2)
 PY
+# One fixed name for the server's own log (API and worker), for the tester to read.
+ln -sf "$(python3 -c "import json;print(json.load(open('$OUT/backend.json'))['log_path'])")" "$OUT/server.log"
 echo "up: $SHA api=$API web=$WEB in $(( $(date +%s) - t0 ))s"
