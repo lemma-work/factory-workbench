@@ -1,0 +1,8 @@
+{
+  "name": "factory-workbench-tester",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "playwright": "1.60.0"
+  }
+}

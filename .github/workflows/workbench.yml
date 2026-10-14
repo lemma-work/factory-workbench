@@ -1,0 +1,218 @@
+# The workbench: boot lemma-platform at a pull request's commit, and its merge
+# base beside it, then test it the way a person would use it.
+#
+# Dispatched by the Factory pod. The harness comes from this repository and the
+# code under test from the target repository, so the change being judged cannot
+# edit the thing judging it.
+#
+# Two ways to use a run, and one run can do both:
+#   batch        `flows` names scripts under tester/flows; each runs against the
+#                base stack ("before") and the head stack ("after") and leaves
+#                video, trace, screenshots and result.json in the evidence.
+#   interactive  with `public_key` and `lease_minutes`, the runner opens SSH over
+#                a Cloudflare quick tunnel and holds the machine for the tester.
+#                Only the holder of the matching private key can log in.
+#
+# THE SHARP EDGE: while a lease is open, the tunnel is a public address onto a
+# machine with the code on it. The lease is short and this job carries no
+# secret at all: no push token, no Lemma credential, no provider key. Keep it so.
+
+name: workbench
+run-name: "workbench ${{ inputs.repo }}@${{ inputs.head_sha }} ${{ inputs.session_id }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: Repository under test
+        default: lemma-work/lemma-platform
+      head_sha:
+        description: Full commit sha under test
+        required: true
+      base_sha:
+        description: Merge base to boot beside it ("before"); empty = head only
+        default: ""
+      flows:
+        description: Space-separated flow names under tester/flows to run in batch
+        default: ""
+      lease_minutes:
+        description: How long to hold the machine for an interactive tester (0 = none)
+        default: "0"
+      public_key:
+        description: The tester's ephemeral SSH public key
+        default: ""
+      session_id:
+        description: The pod's qa_run id, echoed into every artifact
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  workbench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      WB: /tmp/wb
+    steps:
+      - name: Check out the workbench
+        uses: actions/checkout@v7
+        with:
+          path: workbench
+
+      - name: Check out the head under test
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.repo }}
+          ref: ${{ inputs.head_sha }}
+          path: head
+          persist-credentials: false
+
+      - name: Check out the merge base
+        if: inputs.base_sha != ''
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.repo }}
+          ref: ${{ inputs.base_sha }}
+          path: base
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            */tests/scenarios/uv.lock
+            */lemma-backend/uv.lock
+      - uses: actions/setup-python@v7
+        with:
+          python-version-file: head/.python-version
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: head/.nvmrc
+
+      - name: Install the tester's browser
+        working-directory: workbench/tester
+        run: |
+          npm ci --no-audit --no-fund
+          npx playwright install --with-deps chromium
+
+      # Head and base boot side by side on their own ports. A stack that will
+      # not start is a tooling failure: nothing was tested, and it says so.
+      - name: Boot
+        id: boot
+        continue-on-error: true
+        run: |
+          mkdir -p "$WB"
+          workbench/boot/up.sh head 8710 3000 "$WB/head" & h=$!
+          if [ -d base ]; then workbench/boot/up.sh base 8711 3001 "$WB/base" & b=$!; fi
+          wait $h; head_rc=$?
+          base_rc=0; [ -n "${b:-}" ] && { wait $b; base_rc=$?; }
+          echo "head=$([ $head_rc = 0 ] && echo up || echo failed_to_boot)" >> "$GITHUB_OUTPUT"
+          echo "base=$([ -z "${b:-}" ] && echo none || ([ $base_rc = 0 ] && echo up || echo failed_to_boot))" >> "$GITHUB_OUTPUT"
+          free -m; nproc
+
+      - name: Record the boot
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib
+          wb = pathlib.Path(os.environ["WB"])
+          def read(p):
+              try: return json.loads((wb / p).read_text())
+              except Exception: return None
+          json.dump({
+              "session_id": "${{ inputs.session_id }}",
+              "repo": "${{ inputs.repo }}",
+              "run_id": "${{ github.run_id }}",
+              "head": read("head/stack.json"),
+              "base": read("base/stack.json"),
+          }, open(wb / "environment.json", "w"), indent=2)
+          PY
+          cat "$WB/environment.json"
+
+      - name: Publish the boot
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: workbench-boot
+          path: /tmp/wb/environment.json
+          retention-days: 3
+
+      - name: Run the batch flows
+        if: steps.boot.outputs.head == 'up' && inputs.flows != ''
+        working-directory: workbench/tester
+        run: |
+          for flow in ${{ inputs.flows }}; do
+            if [ "${{ steps.boot.outputs.base }}" = up ]; then
+              node "flows/$flow.mjs" http://localhost:3001 "$WB/evidence" before || true
+            fi
+            node "flows/$flow.mjs" http://localhost:3000 "$WB/evidence" after || true
+          done
+
+      - name: Open the workbench
+        id: shell
+        if: steps.boot.outputs.head == 'up' && inputs.public_key != '' && inputs.lease_minutes != '0'
+        timeout-minutes: 3
+        continue-on-error: true
+        env:
+          PUBLIC_KEY: ${{ inputs.public_key }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$PUBLIC_KEY" >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys
+          sudo mkdir -p /run/sshd && (sudo systemctl start ssh 2>/dev/null || sudo /usr/sbin/sshd)
+          curl -fsSL -o /tmp/cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x /tmp/cloudflared
+          nohup /tmp/cloudflared tunnel --no-autoupdate --url tcp://localhost:22 > /tmp/cf.log 2>&1 &
+          host=""
+          for _ in $(seq 1 45); do
+            host=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cf.log | head -1 || true)
+            [ -n "$host" ] && break; sleep 2
+          done
+          [ -n "$host" ] || { echo "no tunnel hostname after 90s"; tail -20 /tmp/cf.log; exit 1; }
+          printf '{"ssh_hostname":"%s","user":"%s","head":{"api":8710,"web":3000},"base":{"api":8711,"web":3001},"evidence_dir":"%s/evidence","release_file":"%s/release","session_id":"%s"}\n' \
+            "$host" "$(whoami)" "$WB" "$WB" "${{ inputs.session_id }}" > "$WB/workbench.json"
+
+      - name: Publish the address
+        if: steps.shell.outcome == 'success'
+        uses: actions/upload-artifact@v7
+        with:
+          name: workbench-address
+          path: /tmp/wb/workbench.json
+          retention-days: 1
+
+      # Ends early when the tester touches the release file.
+      - name: Hold the lease
+        if: steps.shell.outcome == 'success'
+        run: |
+          end=$(( $(date +%s) + ${{ inputs.lease_minutes }} * 60 ))
+          while [ "$(date +%s)" -lt "$end" ] && [ ! -f "$WB/release" ]; do sleep 5; done
+
+      - name: Collect the evidence
+        if: always()
+        run: |
+          mkdir -p "$WB/evidence/logs"
+          for side in head base; do
+            cp "$WB/$side/backend.log" "$WB/evidence/logs/$side-backend.log" 2>/dev/null || true
+            cp "$WB/$side/frontend.log" "$WB/evidence/logs/$side-frontend.log" 2>/dev/null || true
+            log=$(python3 -c "import json;print(json.load(open('$WB/$side/backend.json'))['log_path'])" 2>/dev/null || true)
+            [ -n "$log" ] && cp "$log" "$WB/evidence/logs/$side-server.log" 2>/dev/null || true
+            workbench/boot/down.sh "$WB/$side" || true
+          done
+          cp "$WB/environment.json" "$WB/evidence/" 2>/dev/null || true
+
+      - name: Publish the evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: workbench-evidence
+          path: /tmp/wb/evidence
+          retention-days: 7
+
+      - name: Fail the run if the head never booted
+        if: steps.boot.outputs.head != 'up'
+        run: |
+          echo "the code under test did not boot; nothing was tested"
+          cat "$WB/head/stack.json" 2>/dev/null || true
+          exit 1
