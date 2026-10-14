@@ -1,4 +1,5 @@
 name: Logos experiment
+run-name: Logos experiment ${{ inputs.experiment || github.ref_name }}
 
 # Rung 3 of a Logos claim: an executed test on a real lemma-platform stack.
 #
@@ -21,6 +22,14 @@ on:
       experiment:
         description: experiment id (folder under pods/LOGOS/experiments)
         required: true
+      test_b64:
+        description: the test file, gzip + base64 (when the experiment is not committed)
+        required: false
+        default: ''
+      meta_b64:
+        description: experiment.json, gzip + base64 (when the experiment is not committed)
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -39,9 +48,19 @@ jobs:
 
       - name: Which experiment
         id: exp
+        env:
+          TEST_B64: ${{ inputs.test_b64 }}
+          META_B64: ${{ inputs.meta_b64 }}
         run: |
           if [ -n "${{ inputs.experiment }}" ]; then id="${{ inputs.experiment }}"; else id="${GITHUB_REF_NAME#logos-exp/}"; fi
+          case "$id" in *[!a-zA-Z0-9._-]*) echo "bad experiment id"; exit 1;; esac
           dir="pods/LOGOS/experiments/$id"
+          # dispatched by the Logos pod: the experiment arrives as inputs instead of a commit
+          if [ -n "$TEST_B64" ]; then
+            mkdir -p "$dir"
+            printf '%s' "$TEST_B64" | base64 -d | gunzip > "$dir/test_experiment.py"
+            printf '%s' "$META_B64" | base64 -d | gunzip > "$dir/experiment.json"
+          fi
           test -f "$dir/experiment.json" || { echo "no $dir/experiment.json"; exit 1; }
           ref=$(python3 -c "import json;print(json.load(open('$dir/experiment.json')).get('ref') or 'main')")
           echo "id=$id" >> "$GITHUB_OUTPUT"
