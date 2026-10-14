@@ -1,0 +1,153 @@
+name: Logos experiment
+
+# Rung 3 of a Logos claim: an executed test on a real lemma-platform stack.
+#
+# An experiment is a folder, pods/LOGOS/experiments/<id>/, holding a pytest
+# file written against lemma-platform's own black-box scenario harness and an
+# experiment.json saying which claim it settles and which monitors to check.
+# Pushing a branch named logos-exp/<id> (or dispatching this workflow) boots
+# the stack from tests/scenarios, points the backend and worker at a local
+# OpenTelemetry collector, runs the test, and uploads everything Logos needs to
+# decide: the JUnit report, every span as OTLP JSON, and the stack's log tail.
+# Logos reads the artifact back, turns the spans into an observed story on the
+# machine, and evaluates the monitors. The test's pass/fail is one signal; the
+# spans are the other.
+
+on:
+  push:
+    branches: ['logos-exp/**']
+  workflow_dispatch:
+    inputs:
+      experiment:
+        description: experiment id (folder under pods/LOGOS/experiments)
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: logos-exp-${{ github.ref }}-${{ inputs.experiment }}
+  cancel-in-progress: false
+
+jobs:
+  run:
+    name: experiment
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Which experiment
+        id: exp
+        run: |
+          if [ -n "${{ inputs.experiment }}" ]; then id="${{ inputs.experiment }}"; else id="${GITHUB_REF_NAME#logos-exp/}"; fi
+          dir="pods/LOGOS/experiments/$id"
+          test -f "$dir/experiment.json" || { echo "no $dir/experiment.json"; exit 1; }
+          ref=$(python3 -c "import json;print(json.load(open('$dir/experiment.json')).get('ref') or 'main')")
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          repository: lemma-work/lemma-platform
+          ref: ${{ steps.exp.outputs.ref }}
+          path: platform
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            platform/tests/scenarios/uv.lock
+            platform/lemma-backend/uv.lock
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: platform/.python-version
+
+      # The suite boots the backend with the backend's own interpreter.
+      - name: Sync backend
+        working-directory: platform/lemma-backend
+        run: uv sync
+
+      - name: OpenTelemetry collector (every span to a file)
+        run: |
+          mkdir -p "$RUNNER_TEMP/otel" && chmod 777 "$RUNNER_TEMP/otel"
+          cat > "$RUNNER_TEMP/otel/config.yaml" <<'EOF'
+          receivers:
+            otlp:
+              protocols:
+                http: { endpoint: 0.0.0.0:4318 }
+                grpc: { endpoint: 0.0.0.0:4317 }
+          processors:
+            batch: { timeout: 200ms, send_batch_size: 64 }
+          exporters:
+            file/traces: { path: /otel/spans.jsonl }
+            nop: {}
+          service:
+            pipelines:
+              traces: { receivers: [otlp], processors: [batch], exporters: [file/traces] }
+              metrics: { receivers: [otlp], exporters: [nop] }
+              logs: { receivers: [otlp], exporters: [nop] }
+          EOF
+          docker run -d --name otel --user 0 -p 4317:4317 -p 4318:4318 -v "$RUNNER_TEMP/otel:/otel" \
+            otel/opentelemetry-collector-contrib:0.139.0 --config=/otel/config.yaml
+          sleep 3 && docker logs otel | tail -5
+
+      - name: Put the experiment into the scenario suite
+        run: |
+          mkdir -p platform/tests/scenarios/journeys/logos
+          touch platform/tests/scenarios/journeys/logos/__init__.py
+          cp ${{ steps.exp.outputs.dir }}/test_*.py platform/tests/scenarios/journeys/logos/
+          cp pods/LOGOS/runner/logos_faults.py platform/tests/scenarios/journeys/logos/
+
+      - name: Run it
+        id: run
+        working-directory: platform/tests/scenarios
+        env:
+          OBSERVABILITY_ENABLED: 'true'
+          OTEL_EXPORTER_OTLP_ENDPOINT: http://127.0.0.1:4318
+          OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+          OTEL_TRACES_SAMPLER: always_on
+          OTEL_BSP_SCHEDULE_DELAY: '100'
+          LOGOS_SPANS: ${{ runner.temp }}/otel/spans.jsonl
+          LOGOS_FAULTS_LOG: ${{ runner.temp }}/out/faults.jsonl
+        run: |
+          mkdir -p "$RUNNER_TEMP/out"
+          uv sync
+          start=$(date +%s)
+          set +e
+          uv run --with hypothesis pytest journeys/logos -q -p no:cacheprovider --junitxml="$RUNNER_TEMP/out/junit.xml" 2>&1 | tee "$RUNNER_TEMP/out/pytest.txt"
+          code=${PIPESTATUS[0]}
+          set -e
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "seconds=$(( $(date +%s) - start ))" >> "$GITHUB_OUTPUT"
+
+      - name: Collect
+        if: always()
+        run: |
+          sleep 3
+          docker stop otel >/dev/null 2>&1 || true
+          out="$RUNNER_TEMP/out"
+          cp "$RUNNER_TEMP/otel/spans.jsonl" "$out/" 2>/dev/null || echo "no spans file" > "$out/spans.missing"
+          for f in /tmp/lemma-scenarios-*.log; do [ -f "$f" ] && tail -n 600 "$f"; done > "$out/stack-tail.log" 2>/dev/null || true
+          cp ${{ steps.exp.outputs.dir }}/experiment.json "$out/"
+          python3 - <<EOF
+          import json, os
+          json.dump({
+            "experiment": "${{ steps.exp.outputs.id }}",
+            "pytest_exit": int("${{ steps.run.outputs.code }}" or -1),
+            "seconds": int("${{ steps.run.outputs.seconds }}" or 0),
+            "platform_ref": "${{ steps.exp.outputs.ref }}",
+            "platform_sha": os.popen("git -C platform rev-parse HEAD").read().strip(),
+            "run_id": "${{ github.run_id }}",
+          }, open(os.path.join("$out", "result.json"), "w"), indent=2)
+          EOF
+          ls -la "$out"; wc -l "$out/spans.jsonl" || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: logos-${{ steps.exp.outputs.id }}
+          path: ${{ runner.temp }}/out
+          retention-days: 14

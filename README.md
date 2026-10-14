@@ -26,3 +26,12 @@ boot/up.sh ../lemma-platform 18710 13000 /tmp/wb/head
 (cd tester && npm ci && node flows/signup.mjs http://localhost:13000 /tmp/wb/evidence after)
 boot/down.sh /tmp/wb/head
 ```
+
+## Logos experiments
+
+The Logos pod (`gappyai/lemma-pods`, `pods/LOGOS`) runs its claim experiments here as well.
+- **What an experiment is:** a branch `logos-exp/<key>`, pushed by the pod's `run_experiments` function through the GitHub connector, holding `pods/LOGOS/experiments/<key>/` (a pytest file against lemma-platform's scenario harness, plus its monitors).
+- **What the push does:** it starts `.github/workflows/logos-experiment.yml`. The workflow boots the stack with the platform's own harness, records every span with an OpenTelemetry collector, and uploads JUnit, the spans and a fault log as the artifact `logos-<key>`. The pod collects that artifact and decides the verdict.
+- **The fault kit:** `pods/LOGOS/runner/logos_faults.py` is a copy of the one in lemma-pods. It kills and restarts a worker at a telemetry breakpoint, replays stream entries, destroys consumer groups and reads SQL.
+
+Like `workbench.yml`, the job holds no secret.
