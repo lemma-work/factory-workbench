@@ -26,7 +26,10 @@ fail() {
 cd "$CHECKOUT"
 SHA=$(git rev-parse HEAD)
 
-log=$( (uv sync --project lemma-backend -q && cd tests/scenarios && uv sync -q) 2>&1 ) || fail python_deps "$log"
+# Documents are converted in-process (xberg) when the commit has that extra: the scenario
+# harness starts no converter container, and without one every upload stays PENDING.
+if grep -q '^xberg = \[' lemma-backend/pyproject.toml 2>/dev/null; then EXTRA="--extra xberg"; else EXTRA=""; fi
+log=$( (uv sync --project lemma-backend $EXTRA -q && cd tests/scenarios && uv sync -q) 2>&1 ) || fail python_deps "$log"
 log=$( (cd lemma-typescript && npm ci --no-audit --no-fund -q && npm run build -s) 2>&1 ) || fail sdk_build "$log"
 log=$( (cd lemma-frontend && npm ci --no-audit --no-fund -q) 2>&1 ) || fail frontend_deps "$log"
 t_deps=$(( $(date +%s) - t0 ))
@@ -68,6 +71,8 @@ import json, sys
 out, sha, api, web, deps, build, total = sys.argv[1:]
 backend = json.load(open(f"{out}/backend.json"))
 json.dump({"state": "up", "sha": sha, "api": api, "web": web,
+           # what this stack can and cannot do, so a check that needs it is told before it records
+           "capabilities": backend.get("capabilities", {}),
            "seconds": {"deps": int(deps), "frontend_build": int(build), "total": int(total),
                        "backend_boot": backend.get("boot_seconds")},
            "health": backend.get("health")}, open(f"{out}/stack.json", "w"), indent=2)

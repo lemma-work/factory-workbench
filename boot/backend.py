@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import signal
+import subprocess
 import sys
 import time
 import urllib.request
@@ -47,6 +48,18 @@ def main() -> int:
         spec.env["CORS_ORIGINS"] = json.dumps(
             [args.frontend, args.frontend.replace("localhost", "127.0.0.1")]
         )
+        # Convert documents in-process: the harness starts no Kreuzberg container,
+        # so the default HTTP converter is refused and every upload stays PENDING.
+        if documents["processor"] == "xberg":
+            spec.env["DOCUMENT_PROCESSOR"] = "xberg"
+            spec.env["KREUZBERG_URL"] = ""
+
+    documents = {"processor": "none", "why": "the backend at this commit has no in-process converter (xberg extra)"}
+    probe = subprocess.run(
+        [getattr(stack_module, "_backend_python", lambda: sys.executable)(), "-c", "import xberg"], capture_output=True, text=True
+    )
+    if probe.returncode == 0:
+        documents = {"processor": "xberg", "why": "in-process"}
 
     generator = stack_module.start_stack(configure)
     started = time.monotonic()
@@ -60,6 +73,7 @@ def main() -> int:
                 "log_path": stack.log_path,
                 "health": health,
                 "boot_seconds": round(time.monotonic() - started, 1),
+                "capabilities": {"documents": documents},
             }
         )
     )

@@ -35,3 +35,19 @@ The Logos pod (`gappyai/lemma-pods`, `pods/LOGOS`) runs its claim experiments he
 - **The fault kit:** `pods/LOGOS/runner/logos_faults.py` is a copy of the one in lemma-pods. It kills and restarts a worker at a telemetry breakpoint, replays stream entries, destroys consumer groups and reads SQL.
 
 Like `workbench.yml`, the job holds no secret.
+
+## What a stack can do
+
+`stack.json` carries `capabilities`, read once the backend answers. Today:
+`documents.processor` is `xberg` (uploads are converted in-process, so a document reaches
+COMPLETED and is searchable) or `none` (this commit has no in-process converter, so every
+upload stays PENDING). A check that needs a processed document on a stack that says `none`
+is *could not tell*, said up front, not after minutes of waiting.
+
+## Recordings
+
+Every step has a 60 s deadline unless it asks for more (`step(title, fn, { timeout })`).
+After a run, ffmpeg (installed by the workflow when the runner lacks it) drops frames that
+barely change, at most ~2 s at a time: a 3-minute wait plays as a beat while every change on
+screen stays. `result.json` says `video_full_seconds`, `video_seconds` and `video_compacted`.
+

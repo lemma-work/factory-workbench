@@ -95,6 +95,8 @@ jobs:
         run: |
           npm ci --no-audit --no-fund
           npx playwright install --with-deps chromium
+          # ffmpeg cuts the idle stretches out of each recording (tester/qa.mjs)
+          command -v ffmpeg >/dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg)
 
       # Head and base boot side by side on their own ports. A stack that will
       # not start is a tooling failure: nothing was tested, and it says so.
