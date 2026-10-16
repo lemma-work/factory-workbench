@@ -97,6 +97,10 @@ jobs:
           npx playwright install --with-deps chromium
           # ffmpeg cuts the idle stretches out of each recording (tester/qa.mjs)
           command -v ffmpeg >/dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg)
+          # the tester works over SSH, whose shell does not get the PATH setup-uv/setup-python gave these
+          # steps: put uv and the python next to it on the system path, so journeys run as in CI
+          sudo ln -sf "$(command -v uv)" /usr/local/bin/uv
+          sudo ln -sf "$(command -v uvx)" /usr/local/bin/uvx 2>/dev/null || true
 
       # Head and base boot side by side on their own ports. A stack that will
       # not start is a tooling failure: nothing was tested, and it says so.
