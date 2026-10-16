@@ -10,8 +10,8 @@
 //     })
 //
 // What lands in <out>/<name>-<phase>/:
-//   video.webm       the whole run, with idle stretches cut short (a page that does not change
-//                    for more than ~2 s plays as one frame), when ffmpeg is on the machine
+//   video.webm       the whole run at real speed, except that a stretch where nothing on screen
+//                    changes for more than 10 s plays as 5 s (video_cuts in result.json says where)
 //   trace.zip        Playwright trace (open with `npx playwright show-trace`)
 //   NN-<step>.png    a screenshot after every step, passed or failed
 //   result.json      steps, verdict, console errors, failed requests, timings
@@ -34,26 +34,33 @@ const { chromium, expect } = require('playwright/test')
 
 const STEP_TIMEOUT = 60_000
 
-// Cut a recording's idle stretches: frames that barely differ from the last are dropped, up to
-// ~2 s at a time, so a long wait plays as a beat while every change on screen stays.
+// One rule: a stretch where the screen does not change for more than STILL seconds plays as
+// SHOWN seconds. Everything else stays at real speed. ffmpeg's mpdecimate says which frames changed.
+const STILL = 10, SHOWN = 5
 function compact(dir, result) {
   const src = join(dir, 'video.webm'), out = join(dir, 'video.compact.webm')
   if (spawnSync('ffmpeg', ['-version']).status !== 0) return
   const seconds = (f) => Number(spawnSync('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', f]).stdout?.toString().trim()) || null
-  const run = spawnSync('ffmpeg', ['-y', '-loglevel', 'error', '-i', src,
-    '-vf', 'mpdecimate=hi=64*200:lo=64*8:frac=0.05:max=50,setpts=N/(25*TB)', '-r', '25',
-    '-c:v', 'libvpx', '-b:v', '1M', '-deadline', 'realtime', '-an', out], { timeout: 120_000 })
-  if (run.status !== 0) { try { unlinkSync(out) } catch {} return }
-  const full = seconds(src), short = seconds(out)
+  const full = seconds(src)
   result.video_full_seconds = full
-  if (short && full && short < full * 0.85 && statSync(out).size > 10_000) {
-    renameSync(out, src)
-    result.video_seconds = short
-    result.video_compacted = true
-  } else {
-    unlinkSync(out)
-    result.video_seconds = full
+  result.video_seconds = full
+  if (!full) return
+  const probe = spawnSync('ffmpeg', ['-hide_banner', '-i', src, '-vf', 'mpdecimate,showinfo', '-f', 'null', '-'], { timeout: 120_000, maxBuffer: 64 * 1024 * 1024 })
+  const changed = [0, ...[...String(probe.stderr ?? '').matchAll(/pts_time:([\d.]+)/g)].map((m) => Number(m[1])), full]
+  const cuts = []
+  for (let i = 1; i < changed.length; i++) {
+    const a = changed[i - 1], b = changed[i]
+    if (b - a > STILL) cuts.push([a + SHOWN / 2, b - SHOWN / 2])   // keep the first and last 2.5 s of it
   }
+  if (!cuts.length) return
+  const expr = cuts.map(([a, b]) => `between(t,${a.toFixed(2)},${b.toFixed(2)})`).join('+')
+  const run = spawnSync('ffmpeg', ['-y', '-loglevel', 'error', '-i', src, '-vf', `select='not(${expr})',setpts=N/FRAME_RATE/TB`,
+    '-c:v', 'libvpx', '-b:v', '1M', '-deadline', 'realtime', '-an', out], { timeout: 180_000 })
+  if (run.status !== 0 || !statSync(out, { throwIfNoEntry: false })?.size) { try { unlinkSync(out) } catch {} return }
+  renameSync(out, src)
+  result.video_seconds = seconds(src)
+  result.video_compacted = true
+  result.video_cuts = cuts.map(([a, b]) => ({ at: Number(a.toFixed(1)), cut_seconds: Number((b - a).toFixed(1)) }))
 }
 
 const slug = (s) => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 50)

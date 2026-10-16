@@ -47,7 +47,6 @@ is *could not tell*, said up front, not after minutes of waiting.
 ## Recordings
 
 Every step has a 60 s deadline unless it asks for more (`step(title, fn, { timeout })`).
-After a run, ffmpeg (installed by the workflow when the runner lacks it) drops frames that
-barely change, at most ~2 s at a time: a 3-minute wait plays as a beat while every change on
-screen stays. `result.json` says `video_full_seconds`, `video_seconds` and `video_compacted`.
+After a run, a stretch where nothing on screen changes for more than 10 s is shortened to 5 s
+(ffmpeg, installed by the workflow when the runner lacks it); everything else plays at real speed. `result.json` says `video_full_seconds`, `video_seconds` and `video_compacted`.
 
